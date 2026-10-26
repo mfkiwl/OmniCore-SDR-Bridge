@@ -16,6 +16,7 @@
 #include "usbss_uart1_bridge.h"
 #include "usb_ep3_debug.h"
 #include "usb_desc.h"
+#include "vcxo_discipline.h"
 /*********************************************************************
  * @fn      USART1_Init
  *
@@ -30,21 +31,6 @@ void USART1_Init(uint32_t baudrate)
     UART1_Bridge_Init(baudrate);
 } 
 
-void LED_Init(void)
-{
-    GPIO_InitTypeDef  GPIO_InitStructure={0};
-
-    RCC_HB2PeriphClockCmd(RCC_HB2Periph_GPIOA, ENABLE);
-
-    /* PA4 LED is active high; keep it off until 3 A is confirmed. */
-    GPIO_ResetBits(GPIOA, GPIO_Pin_4);
-
-    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4;
-    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_Very_High;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
-    GPIO_Init(GPIOA, &GPIO_InitStructure);
-}
-
  /*********************************************************************
  * @fn      Hardware
  *
@@ -56,6 +42,9 @@ void LED_Init(void)
  */
 void Hardware( void )
 { 
+    /* PA4 now drives the VCTCXO tune node (shared with ADF4002 CP): keep it
+     * high-Z from the first instruction until the Zynq selects mode 2. */
+    VCXO_Init();
 
     /* Disable SWD */
     RCC_HB2PeriphClockCmd(RCC_HB2Periph_AFIO, ENABLE);
@@ -79,6 +68,7 @@ void Hardware( void )
     while(USBSS_DevEnumStatus == 0 && USBHS_DevEnumStatus == 0)
     {
         UART1_Bridge_Task();
+        VCXO_Task();
         USB_Debug_Task();
         Delay_Ms(1);
     }
@@ -87,8 +77,6 @@ void Hardware( void )
     printf("USB%u ready, UHSIF Init\r\n", USBSS_DevEnumStatus ? 3U : 2U);
     UHSIF_Init();
 
-    LED_Init();
-    
     #include "hd3ss3220.h"
 
     HD3SS3220_Result ret;
@@ -100,15 +88,9 @@ void Hardware( void )
     {
         ret = HD3SS3220_PrintInfo();  /* 读取并打印芯片信息和状态 */
 
-        /* Startup snapshot: 0x08[5:4] = 11b means the source offers 3 A.
-         * Detected current is valid here only while attached as UFP/Sink. */
+        /* The 3 A indicator LED on PA4 was removed: PA4 is the VCXO DAC. */
         ret = HD3SS3220_ReadStatus(&typec_status);
-        if (ret == HD3SS3220_OK &&
-            typec_status.attached == HD3SS3220_ATTACHED_UFP &&
-            typec_status.current_detected == 3u)
-        {
-            GPIO_SetBits(GPIOA, GPIO_Pin_4);
-        }
+        (void)typec_status;
     }
 
 
@@ -130,5 +112,6 @@ void Hardware( void )
 void UART_Proc( void )
 {
     UART1_Bridge_Task();
+    VCXO_Task();
     USB_Debug_Task();
 }

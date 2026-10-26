@@ -20,6 +20,7 @@ typedef struct
     uint32_t dma_rx_errors;
     uint32_t dma_tx_errors;
     uint32_t usb_out_errors;
+    uint32_t uart_tx_aborts; /* UART TX DMA stopped before completion */
 } UART1_BridgeStats_t;
 
 /* Inspect using the debugger; never printf on USART1 during bridging. */

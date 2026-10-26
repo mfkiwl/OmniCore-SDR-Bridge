@@ -6,8 +6,13 @@
  * No blocking UART work is performed in the USB interrupt.
  * USB reset / deconfiguration / CLEAR_HALT discard pending affected data.
  * This module deliberately does not treat an idle gap as a protocol frame.
+ * Every received byte is also scanned for Zynq "VCXO" lines with a separate
+ * cursor, so the PA4 loop keeps running while the host does not read EP2.
+ * "vcxo_ack" lines go to the Zynq only between complete host command lines,
+ * and only while the Zynq is idle (see VCXO_TakeReply).
  */
 #include "usbss_uart1_bridge.h"
+#include "vcxo_discipline.h"
 #include "ch32h417_usbss_device.h"
 #include "ch32h417_usbhs_device.h"
 #include "ch32h417_usb.h"
@@ -16,16 +21,29 @@
 #if UART1_BRIDGE_RX_SIZE != 8192U
 #error Review the power-of-two ring and DMA service interval before changing size
 #endif
+/* GCC emits these in reverse order. inject_buf comes first here so it lands
+ * after uart_rx_dma and the USB buffers keep their 1 KiB-aligned addresses:
+ * USBSS EP2 DMA runs with DMA_OFS = 1024. */
+static __attribute__((aligned(32), section(".da1")))
+    uint8_t inject_buf[128];
 static __attribute__((aligned(32), section(".da1")))
     uint8_t uart_rx_dma[UART1_BRIDGE_RX_SIZE];
-static __attribute__((aligned(32), section(".da1")))
+static __attribute__((aligned(1024), section(".da1")))
     uint8_t ep2_out_buf[UART1_BRIDGE_USB_MPS];
-static __attribute__((aligned(32), section(".da1")))
+static __attribute__((aligned(1024), section(".da1")))
     uint8_t ep2_in_buf[UART1_BRIDGE_USB_MPS];
 volatile UART1_BridgeStats_t UART1_BridgeStats;
 static volatile uint32_t rx_wraps;
 static uint32_t rx_consumed;
 static uint32_t rx_snapshot;
+static uint32_t sniff_consumed;
+/* inject_busy: DMA1 ch4 is sending inject_buf, not ep2_out_buf.
+ * host_line_open: the last host byte sent to the Zynq was not '\n'.
+ * zynq_line_dirty: an injected line was sent, or a TX was aborted, since the
+ * last host line; send a lone '\n' first so a cut-off fragment can never
+ * swallow the next host command (an empty line is ignored by the Zynq). */
+static volatile uint8_t inject_busy;
+static uint8_t host_line_open, zynq_line_dirty;
 static volatile uint8_t initialized, configured, rx_fault;
 static uint8_t usb_hs;
 static uint16_t usb_mps = UART1_BRIDGE_USB_MPS;
@@ -123,16 +141,96 @@ static void arm_out(void)
         /* Commit only ONE chain, with ONE packet. No second OUT buffer is armed. */
     USBSSD->EP2_RX.UEP_RX_CHAIN_MAX_NUMP = 1U;
 }
-static void stop_uart_tx(void)
+/* USB-side reset of the OUT path. The UART side does not depend on USB
+ * state: a DMA already sending a line always completes, so a Zynq line is
+ * never cut short, and a packet already accepted from USB is still sent
+ * unless the host clears the EP2 OUT halt (drop_pending). Silent USBSS link
+ * resets (hot reset, link inactive) otherwise discarded a waiting command. */
+static void usb_out_reset(uint8_t drop_pending)
 {
-    if(initialized)
+    out_armed = 0U;
+    if(drop_pending && !tx_dma_busy)
+        out_length = 0U;
+    if(host_line_open && !out_length)
+    {
+        /* The abandoned host line stays partial on the Zynq: close it. */
+        host_line_open = 0U;
+        zynq_line_dirty = 1U;
+    }
+}
+/* Finish the current UART TX DMA and start the next one. Independent of USB
+ * configuration; called with interrupts masked. Order: guard newline, host
+ * packet, then an injected VCXO reply. */
+static void uart_tx_service(void)
+{
+    uint16_t length;
+    if(tx_dma_busy)
+    {
+        if(DMA1->INTFR & DMA1_FLAG_TE4)
+        {
+            UART1_BridgeStats.dma_tx_errors++;
+            UART1_BridgeStats.uart_tx_aborts++;
+            DMA_Cmd(DMA1_Channel4, DISABLE);
+            DMA_ClearFlag(DMA1, DMA1_FLAG_GL4);
+            if(!inject_busy)
+                out_length = 0U;
+            inject_busy = 0U;
+            tx_dma_busy = 0U;
+            zynq_line_dirty = 1U;
+        }
+        else if(DMA1->INTFR & DMA1_FLAG_TC4)
+        {
+            /* TC4 means all buffer bytes reached USART DATAR. The buffer
+             * can be reused; the last byte may still be on the wire. */
+            DMA_Cmd(DMA1_Channel4, DISABLE);
+            DMA_ClearFlag(DMA1, DMA1_FLAG_GL4);
+            if(!inject_busy)
+            {
+                UART1_BridgeStats.uart_tx_dma_bytes += out_length;
+                out_length = 0U;
+            }
+            inject_busy = 0U;
+            tx_dma_busy = 0U;
+        }
+        else
+            return;
+    }
+    if(out_length && zynq_line_dirty && !host_line_open)
+    {
+        /* Guard newline before the host line; the host packet waits. */
+        inject_buf[0] = '\n';
+        zynq_line_dirty = 0U;
+        length = 1U;
+        inject_busy = 1U;
+    }
+    else if(out_length)
     {
         DMA_Cmd(DMA1_Channel4, DISABLE);
         DMA_ClearFlag(DMA1, DMA1_FLAG_GL4);
+        DMA1_Channel4->MADDR = (uint32_t)ep2_out_buf;
+        DMA_SetCurrDataCounter(DMA1_Channel4, out_length);
+        host_line_open = ep2_out_buf[out_length - 1U] != '\n';
+        VCXO_HostActivity();
+        tx_dma_busy = 1U;
+        dma_fence();
+        DMA_Cmd(DMA1_Channel4, ENABLE);
+        return;
     }
-    tx_dma_busy = 0U;
-    out_length = 0U;
-    out_armed = 0U;
+    else if(!host_line_open &&
+            (length = VCXO_TakeReply(inject_buf, sizeof(inject_buf))) != 0U)
+    {
+        zynq_line_dirty = 1U;
+        inject_busy = 1U;
+    }
+    else
+        return;
+    DMA_Cmd(DMA1_Channel4, DISABLE);
+    DMA_ClearFlag(DMA1, DMA1_FLAG_GL4);
+    DMA1_Channel4->MADDR = (uint32_t)inject_buf;
+    DMA_SetCurrDataCounter(DMA1_Channel4, length);
+    tx_dma_busy = 1U;
+    dma_fence();
+    DMA_Cmd(DMA1_Channel4, ENABLE);
 }
 void UART1_Bridge_Init(uint32_t baudrate)
 {
@@ -185,8 +283,9 @@ void UART1_Bridge_Init(uint32_t baudrate)
     DMA_ITConfig(DMA1_Channel5, DMA_IT_TC | DMA_IT_TE, ENABLE);
     NVIC_SetPriority(DMA1_Channel5_IRQn, 0);
     NVIC_EnableIRQ(DMA1_Channel5_IRQn);
-    rx_wraps = rx_consumed = rx_snapshot = 0;
-    configured = rx_fault = out_armed = tx_dma_busy = in_busy = 0;
+    rx_wraps = rx_consumed = rx_snapshot = sniff_consumed = 0;
+    configured = rx_fault = out_armed = tx_dma_busy = in_busy = inject_busy = 0;
+    host_line_open = zynq_line_dirty = 0;
     out_length = in_length = 0;
     memset((void *)&UART1_BridgeStats, 0, sizeof(UART1_BridgeStats));
     initialized = 1U;
@@ -199,7 +298,7 @@ static void bridge_reset(void)
 {
     uint32_t key = irq_save();
     configured = 0U;
-    stop_uart_tx();
+    usb_out_reset(0U);
     in_busy = 0U;
     in_length = 0U;
     if(initialized && !rx_fault)
@@ -218,7 +317,7 @@ static void bridge_configure(uint8_t enabled, uint8_t high_speed_controller)
 {
     uint32_t key = irq_save();
     configured = 0U;
-    stop_uart_tx();
+    usb_out_reset(0U);
     in_busy = 0U;
     in_length = 0U;
     if(initialized && !rx_fault)
@@ -271,7 +370,7 @@ void UART1_Bridge_ClearHalt(uint8_t endpoint_address)
     }
     else if(endpoint_address == 0x02U)
     {
-        stop_uart_tx();
+        usb_out_reset(1U);
         if(usb_hs)
         {
             USBHSD->UEP2_RX_CTRL = USBHS_UEP_R_RES_NAK;
@@ -302,7 +401,8 @@ void UART1_Bridge_OutIRQ(void)
     }
     dma_fence();
     out_armed = 0U;
-    if(count != 1U || length > usb_mps || out_length || tx_dma_busy)
+    /* An injected line uses its own buffer; this packet waits in ep2_out_buf. */
+    if(count != 1U || length > usb_mps || out_length || (tx_dma_busy && !inject_busy))
     {
         UART1_BridgeStats.usb_out_errors++;
         return;
@@ -329,11 +429,36 @@ void UART1_Bridge_InIRQ(void)
     in_busy = 0U;
     in_length = 0U;
 }
+/* Runs with interrupts enabled. The DMA may overwrite bytes while they are
+ * scanned; a lap detected afterwards resynchronizes the VCXO line parser. */
+static void sniff_rx(void)
+{
+    uint32_t key, produced, i;
+    if(rx_fault)
+        return;
+    key = irq_save();
+    produced = rx_produced();
+    irq_restore(key);
+    if(produced - sniff_consumed > UART1_BRIDGE_RX_SIZE)
+    {
+        sniff_consumed = produced;
+        VCXO_RxReset();
+        return;
+    }
+    for(i = sniff_consumed; i != produced; ++i)
+        VCXO_RxByte(((volatile uint8_t *)uart_rx_dma)[i & (UART1_BRIDGE_RX_SIZE - 1U)]);
+    key = irq_save();
+    if(rx_produced() - sniff_consumed > UART1_BRIDGE_RX_SIZE)
+        VCXO_RxReset();
+    irq_restore(key);
+    sniff_consumed = produced;
+}
 void UART1_Bridge_Task(void)
 {
     uint32_t key, produced, available, count, i, after, uart_status;
     if(!initialized)
         return;
+    sniff_rx();
     key = irq_save();
     /* No RXNE/IDLE handler reads DATAR in normal operation: DMA owns RX.
      * Only recover the status-read/data-read sequence on a UART error.
@@ -344,44 +469,19 @@ void UART1_Bridge_Task(void)
         (void)USART1->DATAR;
         UART1_BridgeStats.uart_error_events++;
     }
+    uart_tx_service();
     if(!configured || !(usb_hs ? USBHS_DevEnumStatus : USBSS_DevEnumStatus))
     {
         if(configured)
         {
             configured = 0U;
-            stop_uart_tx();
+            usb_out_reset(0U);
             in_busy = 0U;
         }
         if(!rx_fault)
             rx_consumed = rx_produced();
         irq_restore(key);
         return;
-    }
-    if(tx_dma_busy)
-    {
-        if(DMA1->INTFR & DMA1_FLAG_TE4)
-        {
-            UART1_BridgeStats.dma_tx_errors++;
-            stop_uart_tx();
-        }
-        else if(DMA1->INTFR & DMA1_FLAG_TC4)
-        {
-            UART1_BridgeStats.uart_tx_dma_bytes += out_length;
-            /* TC4 means all buffer bytes reached USART DATAR. The buffer
-             * can be reused; the last byte may still be on the wire.
-             */
-            stop_uart_tx();
-        }
-    }
-    if(!tx_dma_busy && out_length)
-    {
-        DMA_Cmd(DMA1_Channel4, DISABLE);
-        DMA_ClearFlag(DMA1, DMA1_FLAG_GL4);
-        DMA1_Channel4->MADDR = (uint32_t)ep2_out_buf;
-        DMA_SetCurrDataCounter(DMA1_Channel4, out_length);
-        tx_dma_busy = 1U;
-        dma_fence();
-        DMA_Cmd(DMA1_Channel4, ENABLE);
     }
     arm_out();
     if(rx_fault)
